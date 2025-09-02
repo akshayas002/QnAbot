@@ -1,66 +1,90 @@
+import os
 import streamlit as st
-from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
+from langchain_ollama import OllamaEmbeddings, OllamaLLM
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 
-# ----------------- UI -----------------
-st.set_page_config(page_title="PDF Q&A Bot", layout="wide")
-st.title("📄 PDF Q&A Bot (LangChain + Ollama)")
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="📄 PDF Q&A Assistant", layout="wide")
+st.title("📄 AI PDF Q&A Assistant with Memory")
 
-uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
+# Sidebar Controls
+st.sidebar.header("⚙️ Settings")
+chunk_size = st.sidebar.slider("Chunk size", 200, 2000, 800, 100)
+overlap = st.sidebar.slider("Chunk overlap", 0, 500, 100, 50)
+model_choice = st.sidebar.selectbox("Choose Model", ["llama3", "mistral", "gemma"])
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-if uploaded_file:
-    with open("uploaded.pdf", "wb") as f:
-        f.write(uploaded_file.read())
+# -----------------------------
+# File Upload
+# -----------------------------
+uploaded_files = st.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=True)
 
-    # ----------------- Backend Setup -----------------
-    llm = OllamaLLM(model="llama3")  # Or "mistral", "phi3", etc.
-    loader = PyPDFLoader("uploaded.pdf")
-    docs = loader.load()
+if uploaded_files:
+    all_docs = []
+    for uploaded_file in uploaded_files:
+        # Save PDF temporarily
+        with open(uploaded_file.name, "wb") as f:
+            f.write(uploaded_file.read())
 
-    # Split into chunks
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-    chunks = splitter.split_documents(docs)
+        loader = PyPDFLoader(uploaded_file.name)
+        all_docs.extend(loader.load())
 
-    # Create vector DB
-    embeddings = OllamaEmbeddings(model="llama3")
-    db = Chroma.from_documents(chunks, embeddings)
-    retriever = db.as_retriever()
+    # Split documents
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=overlap)
+    chunks = splitter.split_documents(all_docs)
 
-    # Add memory for chat
+    # Create persistent DB
+    persist_dir = "pdf_db"
+    embeddings = OllamaEmbeddings(model=model_choice)
+    db = Chroma.from_documents(chunks, embeddings, persist_directory=persist_dir)
+    db.persist()
+
+    # Initialize LLM + Retriever
+    llm = OllamaLLM(model=model_choice)
+    retriever = db.as_retriever(search_type="mmr", search_kwargs={"k": 4})
+
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    qa_chain = ConversationalRetrievalChain.from_llm(llm, retriever=retriever, memory=memory, return_source_documents=True)
 
-    qa = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        verbose=True
-    )
-
-    # ----------------- Chat UI -----------------
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    # -----------------------------
+    # Chat Interface
+    # -----------------------------
+    st.subheader("💬 Chat with your PDFs")
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Chat input
-    query = st.chat_input("Ask something about the PDF...")
-    if query:
-        # Display user msg
-        st.chat_message("user").markdown(query)
+    if query := st.chat_input("Ask me anything about the PDFs..."):
         st.session_state.messages.append({"role": "user", "content": query})
 
-        # Get answer
-        result = qa.invoke({"question": query})
+        result = qa_chain.invoke({"question": query})
         answer = result["answer"]
 
-        # Display bot msg
+        # Add sources
+        sources = []
+        for doc in result.get("source_documents", []):
+            fname = os.path.basename(doc.metadata.get("source", ""))
+            page = doc.metadata.get("page", "?")
+            sources.append(f"- **{fname}** (Page {page})")
+        if sources:
+            answer += "\n\n**Sources:**\n" + "\n".join(sources)
+
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+
         with st.chat_message("assistant"):
             st.markdown(answer)
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+    # -----------------------------
+    # Download Chat History
+    # -----------------------------
+    if st.sidebar.button("💾 Download Chat History"):
+        chat_log = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in st.session_state.messages])
+        st.download_button("Download Chat Log", chat_log, "chat_history.txt")
